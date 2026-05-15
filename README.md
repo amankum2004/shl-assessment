@@ -2,29 +2,47 @@
 
 Conversational agent that recommends SHL assessments via a FastAPI service.
 
-## Setup
+## Local setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Set your Groq API key in `.env`:
+Create a `.env` file:
 ```
 GROQ_API_KEY=your_key_here
 ```
 
-## Run
-
+Run:
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+Test:
+```bash
+python test_api.py
+```
+
+## Deploy to Render
+
+1. Push this repo to GitHub (already done).
+2. Go to [render.com](https://render.com) → New → Web Service.
+3. Connect your GitHub repo.
+4. Render auto-detects `render.yaml` — no manual config needed.
+5. Add environment variable: `GROQ_API_KEY` = your key.
+6. Deploy. The `/health` endpoint confirms readiness.
+
 ## Endpoints
 
-- `GET /health` → `{"status": "ok"}`
-- `POST /chat` → conversational agent response
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Returns `{"status": "ok"}` |
+| POST | `/chat` | Conversational agent |
+| GET | `/docs` | Swagger UI |
 
-### POST /chat request
+### POST /chat
+
+Request:
 ```json
 {
   "messages": [
@@ -35,26 +53,26 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 }
 ```
 
-### POST /chat response
+Response:
 ```json
 {
   "reply": "Here are 3 assessments for a mid-level Java developer.",
   "recommendations": [
-    {"name": "Core Java (Advanced Level) (New)", "url": "https://www.shl.com/...", "test_type": "K"}
+    {
+      "name": "Core Java (Advanced Level) (New)",
+      "url": "https://www.shl.com/products/product-catalog/view/core-java-advanced-level-new/",
+      "test_type": "K"
+    }
   ],
   "end_of_conversation": false
 }
 ```
 
-## Test
-
-```bash
-python test_api.py
-```
-
 ## Architecture
 
-- **Catalog**: 377 SHL Individual Test Solutions loaded from `catalog.json`
-- **Retrieval**: `all-MiniLM-L6-v2` sentence embeddings + cosine similarity → top-30 items per query
+- **Catalog**: 377 SHL Individual Test Solutions in `catalog.json`
+- **Retrieval**: `all-MiniLM-L6-v2` embeddings + cosine similarity → top-25 items per query
+- **Mentioned items**: Any catalog item named in the conversation is always included in context
 - **LLM**: Groq `llama-3.3-70b-versatile` with JSON mode
-- **Context**: ~4k tokens per request (fits Groq free tier)
+- **Token budget**: ~4-5k tokens per request (fits Groq free tier)
+- **Turn cap**: Enforced server-side at 8 turns
