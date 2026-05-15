@@ -2,6 +2,13 @@
 SHL Assessment Recommender - FastAPI service
 POST /chat  - stateless conversational agent
 GET  /health - readiness check
+
+Architecture:
+- BM25 retrieval (rank-bm25, pure Python, ~5MB RAM) replaces sentence-transformers (~400MB).
+- Each /chat call retrieves top-K relevant catalog items and injects them into the LLM context.
+- Items mentioned by name in the conversation are always included.
+- Groq llama-3.3-70b-versatile with JSON mode for structured output.
+- Turn cap (8) enforced server-side.
 """
 
 import json
@@ -9,12 +16,12 @@ import os
 import re
 import numpy as np
 from pathlib import Path
+from rank_bm25 import BM25Okapi
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
-from sentence_transformers import SentenceTransformer
 
 # ---------------------------------------------------------------------------
 # Load .env if present
@@ -57,9 +64,12 @@ def keys_to_abbrev(keys: list) -> str:
     return ",".join(KEY_ABBREV.get(k, k[0]) for k in keys) if keys else "—"
 
 # ---------------------------------------------------------------------------
-# Catalog text helpers
+# BM25 index (built at startup, ~5MB RAM)
 # ---------------------------------------------------------------------------
-def _item_search_text(item: dict) -> str:
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def _item_tokens(item: dict) -> list[str]:
     parts = [
         item["name"],
         item.get("description", ""),
@@ -67,8 +77,34 @@ def _item_search_text(item: dict) -> str:
         " ".join(item.get("job_levels", [])),
         " ".join(item.get("languages", [])[:10]),
     ]
-    return " ".join(p for p in parts if p)
+    return _tokenize(" ".join(parts))
 
+print("Building BM25 index...")
+_corpus_tokens = [_item_tokens(i) for i in RAW_CATALOG]
+_bm25 = BM25Okapi(_corpus_tokens)
+print(f"BM25 index ready ({len(RAW_CATALOG)} items).")
+
+def retrieve_top_k(query: str, k: int = 25) -> list[dict]:
+    tokens = _tokenize(query)
+    if not tokens:
+        return RAW_CATALOG[:k]
+    scores = _bm25.get_scores(tokens)
+    top_idx = np.argsort(scores)[::-1][:k]
+    return [RAW_CATALOG[i] for i in top_idx]
+
+def find_mentioned_items(messages: list) -> list[dict]:
+    """Always include catalog items explicitly named in the conversation."""
+    full_text = " ".join(m.content.lower() for m in messages)
+    found, seen = [], set()
+    for name_lower, item in CATALOG_NAMES_LOWER:
+        if name_lower in full_text and name_lower not in seen:
+            found.append(item)
+            seen.add(name_lower)
+    return found
+
+# ---------------------------------------------------------------------------
+# Catalog formatting
+# ---------------------------------------------------------------------------
 def _fmt_item(item: dict) -> str:
     keys = ", ".join(item.get("keys", [])) or "—"
     levels = ", ".join(item.get("job_levels", [])) or "—"
@@ -90,41 +126,12 @@ def _fmt_item(item: dict) -> str:
         f"  Description: {desc}"
     )
 
-# ---------------------------------------------------------------------------
-# Embedding model + index
-# ---------------------------------------------------------------------------
-print("Loading embedding model...")
-_embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-_search_texts = [_item_search_text(i) for i in RAW_CATALOG]
-print(f"Embedding {len(_search_texts)} catalog items...")
-_catalog_embeddings = _embed_model.encode(
-    _search_texts, normalize_embeddings=True, show_progress_bar=False
-).astype(np.float32)
-print("Embeddings ready.")
-
-def retrieve_top_k(query: str, k: int = 25) -> list:
-    q_emb = _embed_model.encode([query], normalize_embeddings=True)[0].astype(np.float32)
-    scores = _catalog_embeddings @ q_emb
-    top_idx = np.argsort(scores)[::-1][:k]
-    return [RAW_CATALOG[i] for i in top_idx]
-
-def find_mentioned_items(messages: list) -> list:
-    full_text = " ".join(m.content.lower() for m in messages)
-    found = []
-    seen = set()
-    for name_lower, item in CATALOG_NAMES_LOWER:
-        if name_lower in full_text and name_lower not in seen:
-            found.append(item)
-            seen.add(name_lower)
-    return found
-
 def build_catalog_context(messages: list, k: int = 25) -> str:
     user_msgs = [m.content for m in messages if m.role == "user"]
     query = " ".join(user_msgs)
     semantic_items = retrieve_top_k(query, k=k)
     mentioned_items = find_mentioned_items(messages)
-    seen_ids = set()
-    merged = []
+    seen_ids, merged = set(), []
     for item in semantic_items + mentioned_items:
         eid = item["entity_id"]
         if eid not in seen_ids:
@@ -194,7 +201,7 @@ class ChatResponse(BaseModel):
     end_of_conversation: bool
 
 # ---------------------------------------------------------------------------
-# Parse LLM response
+# Parse and validate LLM response
 # ---------------------------------------------------------------------------
 def parse_llm_response(text: str) -> ChatResponse:
     text = text.strip()
@@ -206,7 +213,7 @@ def parse_llm_response(text: str) -> ChatResponse:
     try:
         data = json.loads(text, strict=False)
     except json.JSONDecodeError:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group(), strict=False)
@@ -233,7 +240,7 @@ def parse_llm_response(text: str) -> ChatResponse:
 
         catalog_item = CATALOG_BY_NAME.get(name_lower)
         if not catalog_item:
-            # Partial match fallback for minor name variations
+            # Partial match fallback
             for cname_lower, citem in CATALOG_NAMES_LOWER:
                 if name_lower and (name_lower in cname_lower or cname_lower in name_lower):
                     catalog_item = citem
@@ -282,7 +289,6 @@ def chat(request: ChatRequest):
 
     turn_number = len(request.messages)
 
-    # Hard cap enforcement
     if turn_number > MAX_TURNS:
         return ChatResponse(
             reply="We've reached the conversation limit. Please start a new conversation.",
